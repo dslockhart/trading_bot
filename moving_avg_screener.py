@@ -1,3 +1,4 @@
+import datetime
 import datetime as dt
 import numpy as np
 import pandas as pd
@@ -30,10 +31,18 @@ def get_data(currency: str) -> pd.DataFrame:
     return df.iloc[100:]
 
 
-def strategy_sma_9_61(df: pd.DataFrame) -> pd.DataFrame:
-    df["SMA_30"] = df["Close"].rolling(window=9).mean()
-    df["SMA_100"] = df["Close"].rolling(window=61).mean()
-    df["Signal"] = np.where(df["SMA_30"] > df["SMA_100"], 1, -1)
+def strategy_sma_55_160(df: pd.DataFrame) -> pd.DataFrame:
+    df["SMA_55"] = df["Close"].rolling(window=55).mean()
+    df["SMA_160"] = df["Close"].rolling(window=160).mean()
+    df["Signal"] = np.where(df["SMA_55"] > df["SMA_160"], 1, -1)
+    return df
+
+
+def strategy_sma_generic(df: pd.DataFrame, sma: list) -> pd.DataFrame:
+    sma1, sma2 = sma
+    df[f"SMA_{sma1}"] = df["Close"].rolling(window=sma1).mean()
+    df[f"SMA_{sma2}"] = df["Close"].rolling(window=sma2).mean()
+    df["Signal"] = np.where(df[f"SMA_{sma1}"] > df[f"SMA_{sma2}"], 1, -1)
     return df
 
 
@@ -135,9 +144,9 @@ def calculate_bt_metrics(df: pd.DataFrame, perf: List[float], out: float) -> Tup
     return (annualised_returns, annualised_volatility, sharpe_ratio, max_dd, perf[0], perf[1], out)
 
 
-def find_sma_combo(df0: pd.DataFrame):
-    sma1 = range(5, 80, 1)
-    sma2 = range(30, 281, 1)
+def find_sma_combo(df0: pd.DataFrame, currency: str):
+    sma1 = range(5, 80, 10)
+    sma2 = range(30, 281, 10)
 
     results = pd.DataFrame()
     for SMA1, SMA2 in product(sma1, sma2):
@@ -147,14 +156,61 @@ def find_sma_combo(df0: pd.DataFrame):
         df['SMA2'] = df['Adj Close'].rolling(SMA2).mean()
         df.dropna(inplace=True)
         df['Position'] = np.where(df['SMA1'] > df['SMA2'], 1, -1)
-        df['Strategy'] = df['Position'].shift(1) * df['Returns']
+        df['strategy_returns'] = df['Position'].shift(1) * df['Returns']
         df.dropna(inplace=True)
-        perf = np.exp(df[['Returns', 'Strategy']].sum())
+        perf = np.exp(df[['Returns', 'strategy_returns']].sum())
+        out = perf['strategy_returns'] - perf['Returns']
+        a = calculate_bt_metrics(df, perf, out)
         results = results._append(pd.DataFrame(
-            {'SMA1': SMA1, 'SMA2': SMA2, 'Market': perf['Returns'], 'Strategy': perf['Strategy'],
-             'Out': perf['Strategy'] - perf['Returns']},
-            index=[0]), ignore_index=True)
-    results.sort_values('Out', ascending=False).head(10)
+            {
+                "Strategy": 'SMA',
+                "Avg_1": SMA1,
+                "Avg_2": SMA2,
+                "Currency": currency,
+                "Annualised Return": a[0],
+                "Annualised Volatility": a[1],
+                "Sharpe Ratio": a[2],
+                "Max Drawdown": a[3],
+                "Baseline Performance": a[4],
+                "Strategy Performance": a[5],
+                "Difference": a[6]
+            }, index=[0]), ignore_index=True)
+    # results.sort_values("Annualised Return", ascending=False).head(10)
+    return results
+
+
+def find_ewm_combo(df0: pd.DataFrame, currency: str):
+    sma1 = range(5, 80, 10)
+    sma2 = range(30, 281, 10)
+
+    results = pd.DataFrame()
+    for EWM1, EWM2 in product(sma1, sma2):
+        df = df0.__deepcopy__()
+        df['Returns'] = np.log(df['Adj Close'] / df['Adj Close'].shift(1))
+        df['EWM1'] = df['Adj Close'].ewm(span=EWM1, adjust=False).mean()
+        df['EWM2'] = df['Adj Close'].ewm(span=EWM2, adjust=False).mean()
+        df.dropna(inplace=True)
+        df['Position'] = np.where(df['EWM1'] > df['EWM2'], 1, -1)
+        df['strategy_returns'] = df['Position'].shift(1) * df['Returns']
+        df.dropna(inplace=True)
+        perf = np.exp(df[['Returns', 'strategy_returns']].sum())
+        out = perf['Returns'] - perf['strategy_returns']
+        a = calculate_bt_metrics(df, perf, out)
+        results = results._append(pd.DataFrame(
+            {
+                "Strategy": 'EWM',
+                "Currency": currency,
+                "Avg_1": EWM1,
+                "Avg_2": EWM2,
+                "Annualised Return": a[0],
+                "Annualised Volatility": a[1],
+                "Sharpe Ratio": a[2],
+                "Max Drawdown": a[3],
+                "Baseline Performance": a[4],
+                "Strategy Performance": a[5],
+                "Difference": a[6]
+            }, index=[0]), ignore_index=True)
+    # results.sort_values('Out', ascending=False).head(10)
     return results
 
 
@@ -227,6 +283,12 @@ def trade(client: API, instrument: str, units: int, tp: int, sl: int):
     print(rv)
 
 
+def log_transaction(instrument: str, strategy: str, amount: int, tp: float, sl: float) -> None:
+    with open('trading_logs.txt', 'a') as f:
+        date = datetime.datetime.now()
+        f.write(f'{date}\t{strategy}\t{instrument}\t{amount}\t{tp}\t{sl}\n')
+
+
 def trading_job(instrument: Tuple[str, Pair], strategy: Callable, active: bool = False):
     candles = get_candles(instrument[1], 110)
     dfstream = candle_to_df(candles)
@@ -242,10 +304,12 @@ def trading_job(instrument: Tuple[str, Pair], strategy: Callable, active: bool =
         print(f"Selling {instrument[0]}")
         if active:
             trade(client, instrument[0], -1000, TPSell, SLSell)
+            log_transaction(instrument[0], strategy.__name__, -1000, TPSell, SLSell)
     elif int(signal) == 1:
         print(f"Buying {instrument[0]}")
         if active:
             trade(client, instrument[0], 1000, TPBuy, SLBuy)
+            log_transaction(instrument[0], strategy.__name__, 1000, TPBuy, SLBuy)
 
 
 def backtest_all(strategies: List[Callable], currency_pairs: Dict[str, Pair]):
@@ -278,6 +342,106 @@ def backtest_all(strategies: List[Callable], currency_pairs: Dict[str, Pair]):
                                                  "Difference"])
     print(grouped.head())
 
+def compare_bt_performances(currency_pairs: Dict[str, Pair]):
+    res_l = []
+    for pair in currency_pairs.items():
+        df = get_data(pair[0])
+        ewm = find_ewm_combo(df, pair[0])
+        sma = find_sma_combo(df, pair[0])
+        res_l.append(pd.concat([ewm, sma]))
+    res_df = pd.concat(res_l)
+    res_df.sort_values(by='Difference', inplace=True)
+    grouped = res_df.groupby(['Strategy', 'Avg_1', 'Avg_2']).mean('Annualised Return')
+    grouped.sort_values('Annualised Return', ascending=False, inplace=True)
+    grouped.to_csv('Grouped.csv')
+
+
+def polyfit_graph(df: pd.DataFrame, currency: str):
+    x = np.arange(df.index.size)
+    model = np.polyfit(x, df['Adj Close'], 3)
+    m2 = np.polyfit(x, df['Adj Close'], 2)
+    m3 = np.polyfit(x, df['Adj Close'], 10)
+    ry = np.polyval(model, x)
+    ry2 = np.polyval(m2, x)
+    ry3 = np.polyval(m3, x)
+    df['poly_2'] = ry2
+    df['poly_3'] = ry
+    df['poly_10'] = ry3
+    df['p_2_or_10'] = np.where(df['poly_2'] > df['poly_10'], 1, -1)
+    plt.plot(df.index, ry)
+    plt.plot(df.index, ry2)
+    plt.plot(df.index, ry3)
+    plt.plot(df.index, df['Adj Close'])
+    plt.title(f'{currency} Adj Close: y = {model[0]:.2f}x^3 + {model[1]:.2f}x^2 + {model[2]:.2f}x + {model[3]:.2f}')
+    plt.xlabel('Date')
+    plt.ylabel('Price')
+    plt.show()
+
+
+def poly_vs_sma(df0: pd.DataFrame, currency: str, sma: list, poly: list):
+    df = df0.__deepcopy__()
+    df = strategy_sma_generic(df, sma)
+    df.dropna(inplace=True)
+    if len(df) > 1:
+        poly_1, poly_2 = poly
+        x = np.arange(df.index.size)
+
+        p1 = np.polyfit(x, df['Adj Close'], poly_1)
+        p2 = np.polyfit(x, df['Adj Close'], poly_2)
+
+        ry1 = np.polyval(p1, x)
+        ry2 = np.polyval(p2, x)
+        df[f'poly_{poly_1}'] = ry1
+        df[f'poly_{poly_2}'] = ry2
+        df['p_signal'] = np.where(df[f'poly_{poly_1}'] > df[f'poly_{poly_2}'], 1, -1)
+        df['both_signals'] = np.where(df['p_signal'] == df['Signal'], 1, -1)
+        df['Returns'] = np.log(df['Adj Close'] / df['Adj Close'].shift(1))
+        df['strategy_returns'] = df['both_signals'].shift(1) * df['Returns']
+
+        perf = np.exp(df[['Returns', 'strategy_returns']].sum())
+        out = perf['strategy_returns'] - perf['Returns']
+        a = calculate_bt_metrics(df, perf, out)
+        results = pd.DataFrame(
+            {
+                "Strategy": f'Poly({poly}) vs SMA({sma})',
+                "Currency": currency,
+                "Annualised Return": a[0],
+                "Annualised Volatility": a[1],
+                "Sharpe Ratio": a[2],
+                "Max Drawdown": a[3],
+                "Baseline Performance": a[4],
+                "Strategy Performance": a[5],
+                "Difference": a[6]
+            }, index=[0])
+
+        return results
+
+
+def backtest_poly_vs_sma(currency_pairs):
+    l = []
+    sma1 = range(5, 80, 10)
+    sma2 = range(80, 200, 10)
+    poly1 = range(1, 5)
+    poly2 = range(5, 10)
+    for currency in currency_pairs.items():
+        print(currency)
+        df = get_data(currency[0])
+        for SMA1, SMA2 in product(sma1,sma2):
+            sma = [SMA1, SMA2]
+            for POLY1, POLY2 in product(poly1, poly2):
+                poly = [POLY1, POLY2]
+                l.append(poly_vs_sma(df, currency[1][0], sma, poly))
+    df = pd.concat(l)
+    df.to_csv('polyvsma_eq.csv')
+    grouped = df.groupby('Strategy').mean(['Annualised Return'])
+    grouped.to_csv('grouped+poly_eq.csv')
+    print(df.head())
+
+
+def daily_trade(strategies: List[Callable], currency_pairs: Dict[str, Tuple[str, Pair]], active: bool = False):
+    for strategy, pair in product(strategies, currency_pairs.items()):
+        print(f'{"*" * 30}{strategy.__name__}: {pair[1][0]}{"*" * 30}')
+        trading_job(pair[1], strategy, active)
 
 
 if __name__ == "__main__":
@@ -292,14 +456,11 @@ if __name__ == "__main__":
         "EURCAD=X": ("EUR_CAD", Pair.EUR_CAD),
         "EURCHF=X": ("EUR_CHF", Pair.EUR_CHF),  # Swiss Frank
     }
-    strategies = [strategy_sma_9_61, strategy_red_white_blue]  #
-    outputs = {}
-    # backtest_all(strategies, currency_pairs)
-    for strategy, pair in product(strategies, currency_pairs.items()):
-        print(f'{"*" * 30}{strategy.__name__}: {pair[1][0]}{"*" * 30}')
-        df = get_data(pair[0])
-        # find_sma_combo(df)  # output was 9d, 61d
-        signals = get_signals(df, strategy)
-        outputs[f"{strategy.__name__}: {pair[1][0]}"] = signals
-        trading_job(pair[1], strategy, False)
-    # plot_all_strategies(outputs)
+    strategies = [strategy_sma_55_160, strategy_red_white_blue]  #
+
+    # compare_bt_performances(currency_pairs)
+
+    # backtest_poly_vs_sma(currency_pairs)
+    # polyfit_graph(df, "GBPUSD=X")
+
+    daily_trade(strategies, currency_pairs, False)
